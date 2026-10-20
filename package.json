@@ -1,0 +1,33 @@
+{
+  "name": "reachinbox",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev:infra": "docker compose up -d postgres redis elasticsearch",
+    "dev:api": "pnpm --filter @reachinbox/api dev",
+    "dev:worker": "pnpm --filter @reachinbox/worker dev",
+    "dev:web": "pnpm --filter @reachinbox/web dev",
+    "dev": "pnpm run dev:infra && concurrently \"pnpm:dev:api\" \"pnpm:dev:worker\" \"pnpm:dev:web\"",
+    "db:migrate": "pnpm --filter @reachinbox/api db:migrate",
+    "db:seed": "pnpm --filter @reachinbox/api db:seed",
+    "typecheck": "pnpm -r run typecheck",
+    "lint": "pnpm -r run lint",
+    "test": "pnpm -r run test",
+    "test:integration": "pnpm -r run test:integration",
+    "build": "pnpm -r run build",
+    "docker:build": "docker compose build",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down -v"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "prisma": "5.22.0"
+  },
+  "packageManager": "pnpm@9.1.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@prisma/client": "5.22.0"
+  }
+}

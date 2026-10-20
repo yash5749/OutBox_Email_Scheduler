@@ -1,0 +1,214 @@
+// Prisma Schema for ReachInbox Email Scheduler
+// Run: pnpm --filter @reachinbox/api db:migrate
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// Enums
+// ============================================================================
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum EmailStatus {
+  SCHEDULED
+  SENDING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum OutboxEventType {
+  PUBLISH_EMAIL_JOB
+  INDEX_EMAIL
+  SLACK_RATE_LIMIT_ALERT
+}
+
+enum OutboxEventStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum SlackConnectionStatus {
+  ACTIVE
+  DISCONNECTED
+  REVOKED
+}
+
+// ============================================================================
+// Models
+// ============================================================================
+
+model User {
+  id              String    @id @default(uuid())
+  googleSubject   String    @unique @map("google_subject")
+  email           String    @unique
+  name            String
+  avatarUrl       String?   @map("avatar_url")
+  role            UserRole  @default(USER)
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  lastLoginAt     DateTime? @map("last_login_at")
+
+  senders         Sender[]
+  campaigns       Campaign[]
+  scheduledEmails ScheduledEmail[] @relation("UserEmails")
+  slackConnection SlackConnection?
+  outboxEvents    OutboxEvent[]
+
+  @@index([email])
+  @@index([role])
+  @@map("users")
+}
+
+model Sender {
+  id                    String   @id @default(uuid())
+  userId                String   @map("user_id")
+  displayName           String   @map("display_name")
+  fromEmail             String   @map("from_email")
+  smtpHost              String   @map("smtp_host")
+  smtpPort              Int      @map("smtp_port")
+  smtpUser              String   @map("smtp_user")
+  smtpPasswordEncrypted String   @map("smtp_password_encrypted")
+  isActive              Boolean  @default(true) @map("is_active")
+  hourlyLimit           Int?     @map("hourly_limit")
+  minDelayMs            Int?     @map("min_delay_ms")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaigns             Campaign[]
+  scheduledEmails       ScheduledEmail[] @relation("SenderEmails")
+
+  @@index([userId, isActive])
+  @@map("senders")
+}
+
+model Campaign {
+  id                       String      @id @default(uuid())
+  userId                   String      @map("user_id")
+  senderId                 String      @map("sender_id")
+  name                     String?
+  subject                  String
+  body                     String
+  startAt                  DateTime    @map("start_at")
+  minDelayBetweenEmailsMs  Int         @map("min_delay_between_emails_ms")
+  maxEmailsPerHour         Int         @map("max_emails_per_hour")
+  createdAt                DateTime    @default(now()) @map("created_at")
+  updatedAt                DateTime    @updatedAt @map("updated_at")
+
+  user                     User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sender                   Sender      @relation(fields: [senderId], references: [id], onDelete: Restrict)
+  scheduledEmails          ScheduledEmail[]
+
+  @@index([userId])
+  @@index([senderId])
+  @@map("campaigns")
+}
+
+model ScheduledEmail {
+  id                  String       @id @default(uuid())
+  userId              String       @map("user_id")
+  campaignId          String?      @map("campaign_id")
+  senderId            String       @map("sender_id")
+  recipient           String
+  subject             String
+  body                String
+  scheduledAt         DateTime     @map("scheduled_at")
+  status              EmailStatus  @default(SCHEDULED)
+  sentAt              DateTime?    @map("sent_at")
+  failedAt            DateTime?    @map("failed_at")
+  providerMessageId   String?      @map("provider_message_id")
+  providerResponse    Json?        @map("provider_response")
+  attemptCount        Int          @default(0) @map("attempt_count")
+  lastErrorCode       String?      @map("last_error_code")
+  lastErrorMessage    String?      @map("last_error_message")
+  idempotencyKey      String       @unique @map("idempotency_key")
+  processingLeaseUntil DateTime?   @map("processing_lease_until")
+  createdAt           DateTime     @default(now()) @map("created_at")
+  updatedAt           DateTime     @updatedAt @map("updated_at")
+
+  user                User         @relation("UserEmails", fields: [userId], references: [id], onDelete: Cascade)
+  campaign            Campaign?    @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  sender              Sender       @relation("SenderEmails", fields: [senderId], references: [id], onDelete: Restrict)
+  outboxEvents        OutboxEvent[]
+
+  @@index([userId, status, scheduledAt])
+  @@index([senderId, status, scheduledAt])
+  @@index([status, scheduledAt])
+  @@index([campaignId])
+  @@index([recipient])
+  @@map("scheduled_emails")
+}
+
+model OutboxEvent {
+  id              String           @id @default(uuid())
+  eventType       OutboxEventType  @map("event_type")
+  aggregateId     String           @map("aggregate_id") // emailId or campaignId
+  payload         Json
+  status          OutboxEventStatus @default(PENDING)
+  attempts        Int              @default(0)
+  lastError       String?          @map("last_error")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  publishedAt     DateTime?        @map("published_at")
+  nextAttemptAt   DateTime?        @map("next_attempt_at")
+  userId          String           @map("user_id")
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scheduledEmail  ScheduledEmail?  @relation(fields: [aggregateId], references: [id], onDelete: SetNull)
+
+  @@index([status, nextAttemptAt])
+  @@index([eventType, status])
+  @@index([aggregateId])
+  @@map("outbox_events")
+}
+
+model SlackConnection {
+  id                String               @id @default(uuid())
+  userId            String               @unique @map("user_id")
+  teamId            String               @map("team_id")
+  teamName          String               @map("team_name")
+  botUserId         String               @map("bot_user_id")
+  channelId         String               @map("channel_id")
+  channelName       String               @map("channel_name")
+  botTokenEncrypted String               @map("bot_token_encrypted")
+  scopes            String[]
+  status            SlackConnectionStatus @default(ACTIVE)
+  connectedAt       DateTime             @default(now()) @map("connected_at")
+  disconnectedAt    DateTime?            @map("disconnected_at")
+  createdAt         DateTime             @default(now()) @map("created_at")
+  updatedAt         DateTime             @updatedAt @map("updated_at")
+
+  user              User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([teamId])
+  @@map("slack_connections")
+}
+
+model SlackAlert {
+  id              String   @id @default(uuid())
+  senderId        String   @map("sender_id")
+  hourWindow      DateTime @map("hour_window") // UTC hour start
+  alertType       String   @map("alert_type")
+  status          String   @default("PENDING") // PENDING, SENT, FAILED
+  slackResponse   Json?
+  attempts        Int      @default(0)
+  lastError       String?  @map("last_error")
+  createdAt       DateTime @default(now()) @map("created_at")
+  sentAt          DateTime? @map("sent_at")
+
+  @@unique([senderId, hourWindow, alertType], name: "slack_alert_unique")
+  @@index([status, createdAt])
+  @@map("slack_alerts")
+}
