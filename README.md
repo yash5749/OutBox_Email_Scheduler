@@ -287,9 +287,6 @@ Local Docker Redis is **single-node, not HA**. For production:
 └── docker-compose.yml
 ```
 
-## Demo Script
-
-See [docs/demo-script.md](docs/demo-script.md) for the 5-minute demo flow.
 
 ## License
 
