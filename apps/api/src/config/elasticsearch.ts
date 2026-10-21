@@ -68,7 +68,7 @@ interface SearchParams {
   campaignId?: string;
   from?: Date;
   to?: Date;
-  cursor?: string;
+  cursor?: string; // Expecting base64 encoded cursor "scheduledAt|emailId" or single sort
   limit: number;
 }
 
@@ -104,22 +104,41 @@ export async function searchEmails(params: SearchParams): Promise<{ hits: unknow
     must.push({ range: { scheduledAt: range } });
   }
 
-  const searchAfter = params.cursor ? [params.cursor] : undefined;
+  // Parse compound cursor if provided (e.g. "1761048000000_22f7cfce-1719-4cb8-8142-af0a89e87eab")
+  let searchAfter: unknown[] | undefined = undefined;
+  if (params.cursor) {
+    if (params.cursor.includes('_')) {
+      const [scheduledAtStr, emailId] = params.cursor.split('_');
+      searchAfter = [Number(scheduledAtStr) || scheduledAtStr, emailId];
+    } else {
+      searchAfter = [params.cursor];
+    }
+  }
 
   const result = await esClient.search({
     index: ES_INDEX,
     query: { bool: { must } },
-    sort: [{ scheduledAt: { order: 'desc' } }, { _id: { order: 'desc' } }],
+    sort: [{ scheduledAt: { order: 'desc' } }, { emailId: { order: 'desc' } }],
     size: params.limit,
-    search_after: searchAfter,
+    ...(searchAfter ? { search_after: searchAfter } : {}),
     track_total_hits: true,
   });
 
   const hits = result.hits.hits.map(h => {
     const source = h._source as Record<string, unknown>;
-    return { ...source, _id: h._id };
+    return { ...source, _id: h._id, sort: h.sort };
   });
-  const nextCursor = hits.length === params.limit ? hits[hits.length - 1]._id : undefined;
+
+  // Construct compound nextCursor using sort values [scheduledAtTimestamp, emailId]
+  let nextCursor: string | undefined = undefined;
+  if (hits.length === params.limit) {
+    const lastHit = result.hits.hits[result.hits.hits.length - 1];
+    if (lastHit.sort && lastHit.sort.length >= 2) {
+      nextCursor = `${lastHit.sort[0]}_${lastHit.sort[1]}`;
+    } else {
+      nextCursor = hits[hits.length - 1]._id;
+    }
+  }
 
   return {
     hits,

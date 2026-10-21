@@ -7,7 +7,8 @@ import rateLimit from 'express-rate-limit';
 import passport from 'passport';
 import { getEnv } from './config/env';
 import { sessionMiddleware } from './auth/session';
-import { connectRedis, disconnectRedis } from './config/redis';
+import './auth/google';
+import { disconnectRedis } from './config/redis';
 import { ensureIndex } from './config/elasticsearch';
 import { startOutboxPublisher, stopOutboxPublisher } from './services/outbox-publisher';
 import { prisma } from './config/prisma';
@@ -17,6 +18,21 @@ import emailRoutes from './routes/emails';
 import slackRoutes from './routes/slack';
 import healthRoutes from './routes/health';
 import { createSuccessResponse, createErrorResponse } from '@reachinbox/shared';
+import { requireAuth } from './auth/session.js';
+import { UserRole } from '@prisma/client';
+import { createBullBoard } from '@bull-board/api';
+import { BullMQAdapter } from '@bull-board/api/bullMQAdapter';
+import { ExpressAdapter } from '@bull-board/express';
+import { getQueue } from './services/outbox-publisher.js';
+
+// Initialize Bull Board at module level
+const bullBoardAdapter = new ExpressAdapter();
+bullBoardAdapter.setBasePath('/admin/queues');
+createBullBoard({
+  queues: [new BullMQAdapter(getQueue())],
+  serverAdapter: bullBoardAdapter,
+});
+const bullBoardRouter = bullBoardAdapter.getRouter();
 
 const env = getEnv();
 
@@ -79,9 +95,21 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 export async function startApp(): Promise<void> {
-  await connectRedis();
-  await ensureIndex();
+  try {
+    await ensureIndex();
+  } catch (error) {
+    console.error('[App] Elasticsearch unavailable at startup; indexing outbox will retry:', error);
+  }
   await startOutboxPublisher();
+
+  app.use('/admin/queues', requireAuth, (req: Request, res: Response, next: NextFunction) => {
+    const user = req.user as { role: UserRole } | undefined;
+    if (user?.role !== 'ADMIN') {
+      return res.status(403).json(createErrorResponse('FORBIDDEN', 'Admin access required', crypto.randomUUID()));
+    }
+    next();
+  }, bullBoardRouter);
+
   console.log('[App] Started');
 }
 

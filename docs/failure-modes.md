@@ -188,7 +188,18 @@ This document catalogs identified failure modes, their detection, mitigation str
 - Stalled job recovery: BullMQ moves stalled jobs back to `wait` after `lockDuration`
 - PostgreSQL `processingLeaseUntil` on `ScheduledEmail` for external visibility
 
-### 5.2 Bull Board Exposed Publicly
+### 5.2 Database and Queue State Diverge
+**Severity**: P1
+**Cause**: Redis data loss, a worker process crash, or a retained terminal BullMQ job whose email row is still `SCHEDULED`
+**Detection**: `SCHEDULED` rows have completed/failed/unknown jobs, or are due while absent from active queue states
+**Mitigation**:
+- Worker runs a PostgreSQL-to-BullMQ reconciliation scan at startup and every 30 seconds
+- It keeps waiting/delayed/active jobs and replaces completed/failed/unknown jobs for rows still `SCHEDULED`
+- It skips `SENT` and `CANCELLED` rows
+- It recovers expired `SENDING` leases to `SCHEDULED`; review `WORKER_LEASE_EXPIRED` rows because SMTP may have accepted a message just before the worker crashed
+- Manual scan: `pnpm --filter @reachinbox/worker run reconcile`
+
+### 5.3 Bull Board Exposed Publicly
 **Severity**: P0 (security)
 **Cause**: Missing auth middleware on `/admin/queues`
 **Detection**: Penetration test; unauthorized access logs
@@ -197,7 +208,7 @@ This document catalogs identified failure modes, their detection, mitigation str
 - Admin check: `user.role === 'ADMIN'` OR `user.email in BULL_BOARD_ADMIN_EMAILS`
 - Separate subdomain / IP allowlist in production (infrastructure layer)
 
-### 5.3 Environment Variable Misconfiguration
+### 5.4 Environment Variable Misconfiguration
 **Severity**: P0 (startup)
 **Cause**: Missing required vars; invalid formats (e.g., non-hex encryption key)
 **Detection**: App crashes on startup with clear error
@@ -212,9 +223,7 @@ This document catalogs identified failure modes, their detection, mitigation str
 
 ### Reconciler Manual Trigger
 ```bash
-# Via API (admin only)
-POST /api/admin/reconcile
-# Or worker CLI
+# One-shot worker recovery scan
 pnpm --filter @reachinbox/worker run reconcile
 ```
 
@@ -226,8 +235,8 @@ pnpm --filter @reachinbox/worker run es:reindex
 
 ### Redis Data Loss Recovery
 1. Restart Redis (data gone)
-2. Restart API (outbox publisher scans pending events)
-3. Run reconciler (recreates jobs for `SCHEDULED` emails)
+2. Keep the API running; its outbox publisher resumes durable pending events
+3. Keep the worker running; its startup/30-second reconciler recreates jobs for `SCHEDULED` emails
 4. Verify: `GET /api/emails?status=SCHEDULED` matches queue delayed count
 
 ### Stuck SENDING Records

@@ -1,7 +1,8 @@
 'use client';
 
-import { format } from 'date-fns';
-import { ExternalLink, AlertCircle, CheckCircle, Clock, XCircle } from 'lucide-react';
+import { useState } from 'react';
+import { format, isValid } from 'date-fns';
+import { Clock, Star, CheckCircle, XCircle, Loader2 } from 'lucide-react';
 
 interface Email {
   id: string;
@@ -13,6 +14,9 @@ interface Email {
   sender: { id: string; displayName: string; fromEmail: string };
   campaignId: string | null;
   createdAt: string;
+  body?: string | null;
+  preview?: string | null;
+  snippet?: string | null;
 }
 
 interface EmailRowProps {
@@ -20,57 +24,49 @@ interface EmailRowProps {
   showSentAt?: boolean;
 }
 
-const statusColors: Record<string, { bg: string; text: string; icon: React.ReactNode }> = {
-  SCHEDULED: { bg: 'bg-blue-50 dark:bg-blue-900/30', text: 'text-blue-700 dark:text-blue-400', icon: <Clock className="w-3.5 h-3.5" /> },
-  SENDING: { bg: 'bg-yellow-50 dark:bg-yellow-900/30', text: 'text-yellow-700 dark:text-yellow-400', icon: <Loader2 className="w-3.5 h-3.5 animate-spin" /> },
-  SENT: { bg: 'bg-green-50 dark:bg-green-900/30', text: 'text-green-700 dark:text-green-400', icon: <CheckCircle className="w-3.5 h-3.5" /> },
-  FAILED: { bg: 'bg-red-50 dark:bg-red-900/30', text: 'text-red-700 dark:text-red-400', icon: <AlertCircle className="w-3.5 h-3.5" /> },
-  CANCELLED: { bg: 'bg-slate-50 dark:bg-slate-900/30', text: 'text-slate-700 dark:text-slate-400', icon: <XCircle className="w-3.5 h-3.5" /> },
-};
-
-function Loader2({ className, ...props }: React.SVGProps<SVGSVGElement>) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" {...props}>
-      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-    </svg>
-  );
+function safeDateLabel(value?: string | null) {
+  if (!value) return 'Time unavailable';
+  const date = new Date(value);
+  return isValid(date) ? format(date, 'EEE h:mm:ss a') : 'Time unavailable';
 }
 
-export function EmailRow({ email, showSentAt }: EmailRowProps) {
-  const statusConfig = statusColors[email.status] || statusColors.SCHEDULED;
+export function EmailRow({ email, showSentAt = false }: EmailRowProps) {
+  const [starred, setStarred] = useState(false);
+  const status = (email.status || 'SCHEDULED').toUpperCase();
+  const preview = email.preview || email.snippet || email.body || 'No message preview available';
 
   return (
-    <tr className="hover:bg-slate-50 dark:hover:bg-slate-900/50 transition-colors">
-      <td className="px-4 py-3">
-        <div className="font-medium text-slate-900 dark:text-white">{email.recipient}</div>
-      </td>
-      <td className="px-4 py-3 max-w-md">
-        <div className="text-slate-700 dark:text-slate-300 truncate" title={email.subject}>{email.subject}</div>
-      </td>
-      <td className="px-4 py-3 text-sm text-slate-500 dark:text-slate-400">
-        {showSentAt && email.sentAt ? (
-          format(new Date(email.sentAt), 'MMM d, yyyy HH:mm:ss')
+    <article className="ri-email-row">
+      <div className="ri-email-recipient" title={email.recipient}>
+        <span>To: {email.recipient}</span>
+      </div>
+
+      <div className="ri-email-summary">
+        {showSentAt ? (
+          <span className={`ri-mail-status-badge ${status === 'FAILED' ? 'is-failed' : 'is-sent'}`}>
+            {status === 'FAILED' ? <XCircle size={12} /> : status === 'SENDING' ? <Loader2 size={12} className="animate-spin" /> : <CheckCircle size={12} />}
+            {status === 'FAILED' ? 'Failed' : status === 'SENDING' ? 'Sending' : 'Sent'}
+          </span>
         ) : (
-          format(new Date(email.scheduledAt), 'MMM d, yyyy HH:mm:ss')
+          <span className="ri-scheduled-time" title={email.scheduledAt}>
+            <Clock size={12} /> {safeDateLabel(email.scheduledAt)}
+          </span>
         )}
-      </td>
-      <td className="px-4 py-3">
-        <div className="text-sm font-medium text-slate-900 dark:text-white">{email.sender.displayName}</div>
-        <div className="text-xs text-slate-500 dark:text-slate-400">{email.sender.fromEmail}</div>
-      </td>
-      <td className="px-4 py-3">
-        <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${statusConfig.bg} ${statusConfig.text}`}>
-          {statusConfig.icon}
-          {email.status}
-        </span>
-      </td>
-      <td className="px-4 py-3 text-right">
-        <button
-          className="text-sm text-primary-600 dark:text-primary-400 hover:text-primary-700 dark:hover:text-primary-300 font-medium"
-        >
-          View
-        </button>
-      </td>
-    </tr>
+        <div className="ri-email-subject-line" title={email.subject}>
+          <strong>{email.subject || '(No subject)'}</strong>
+          <span className="ri-email-preview"> — {preview}</span>
+        </div>
+      </div>
+
+      <button
+        type="button"
+        className={`ri-star-button ${starred ? 'is-starred' : ''}`}
+        onClick={() => setStarred((current) => !current)}
+        aria-label={starred ? 'Remove star' : 'Star email'}
+        title={starred ? 'Remove star' : 'Star email'}
+      >
+        <Star size={16} fill={starred ? 'currentColor' : 'none'} />
+      </button>
+    </article>
   );
 }

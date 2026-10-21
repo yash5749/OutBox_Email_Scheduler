@@ -16,7 +16,6 @@
     "sourceMap": true,
     "baseUrl": ".",
     "paths": {
-      "@reachinbox/api/*": ["../api/dist/*"],
       "@reachinbox/shared": ["../../packages/shared/dist"]
     },
     "types": ["node"]

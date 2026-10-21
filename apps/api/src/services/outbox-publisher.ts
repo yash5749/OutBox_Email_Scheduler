@@ -3,16 +3,19 @@ import { prisma } from '../config/prisma';
 import { redis } from '../config/redis';
 import { getEnv } from '../config/env';
 import { OutboxEventType, OutboxEventStatus } from '@prisma/client';
+import { esClient, indexEmail, ES_INDEX } from '../config/elasticsearch.js';
+import { sendSlackAlert } from '../routes/slack.js';
 
 const env = getEnv();
 
 const QUEUE_NAME = 'email-delivery';
 const JOB_NAME = 'send-email';
-const PUBLISHER_LEASE_MS = 30000;
+const PUBLISHER_LEASE_MS = 10 * 60 * 1000;
 const BATCH_SIZE = 100;
 const POLL_INTERVAL_MS = 5000;
 const MAX_RETRIES = 10;
 const BASE_RETRY_DELAY_MS = 1000;
+const MAX_RETRY_DELAY_MS = 5 * 60 * 1000;
 
 let queue: Queue | null = null;
 let isRunning = false;
@@ -24,7 +27,6 @@ export function getQueue(): Queue {
   }
   return queue;
 }
-
 function buildJobId(emailId: string): string {
   return `email-${emailId}`;
 }
@@ -36,35 +38,38 @@ async function publishEmailJob(emailId: string, scheduledAt: Date): Promise<void
 
   await q.add(
     JOB_NAME,
-    { emailId, reservedSendAt: scheduledAt.getTime() },
+    { emailId, reservedSendAt: 0 }, // 0 means not yet rate-limited; worker will reserve slot
     { jobId, delay, attempts: env.EMAIL_JOB_ATTEMPTS, backoff: { type: 'exponential', delay: env.EMAIL_RETRY_BASE_DELAY_MS } }
   );
 }
 
 async function processOutboxEvents(): Promise<void> {
-  const leaseId = `publisher-${process.pid}-${Date.now()}`;
   const now = new Date();
 
   try {
     const events = await prisma.$transaction(async (tx) => {
-      const pending = await tx.outboxEvent.findMany({
-        where: {
-          status: OutboxEventStatus.PENDING,
-          OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }],
-        },
-        orderBy: { createdAt: 'asc' },
-        take: BATCH_SIZE,
-      });
-
-      if (pending.length === 0) return [];
-
-      const ids = pending.map(e => e.id);
-      await tx.outboxEvent.updateMany({
-        where: { id: { in: ids } },
-        data: { status: OutboxEventStatus.PROCESSING, attempts: { increment: 1 }, lastError: null },
-      });
-
-      return pending;
+      const leaseUntil = new Date(Date.now() + PUBLISHER_LEASE_MS);
+      const claimed = await tx.$queryRaw<Array<{ id: string }>>`
+        WITH candidates AS (
+          SELECT id
+          FROM outbox_events
+          WHERE status = 'PENDING'
+            AND (next_attempt_at IS NULL OR next_attempt_at <= ${now})
+          ORDER BY created_at ASC
+          FOR UPDATE SKIP LOCKED
+          LIMIT ${BATCH_SIZE}
+        )
+        UPDATE outbox_events AS event
+        SET status = 'PROCESSING',
+            attempts = event.attempts + 1,
+            last_error = NULL,
+            next_attempt_at = ${leaseUntil}
+        FROM candidates
+        WHERE event.id = candidates.id
+        RETURNING event.id
+      `;
+      if (claimed.length === 0) return [];
+      return tx.outboxEvent.findMany({ where: { id: { in: claimed.map(event => event.id) } } });
     });
 
     for (const event of events) {
@@ -76,26 +81,63 @@ async function processOutboxEvents(): Promise<void> {
             break;
           }
           case OutboxEventType.INDEX_EMAIL: {
-            // Handled by separate indexing worker
+            const { emailId } = event.payload as { emailId: string };
+            const email = await prisma.scheduledEmail.findUnique({ where: { id: emailId } });
+            if (email) {
+              await indexEmail({
+                emailId: email.id,
+                userId: email.userId,
+                campaignId: email.campaignId,
+                senderId: email.senderId,
+                recipient: email.recipient,
+                subject: email.subject,
+                body: email.body,
+                status: email.status,
+                scheduledAt: email.scheduledAt,
+                sentAt: email.sentAt,
+                failedAt: email.failedAt,
+                createdAt: email.createdAt,
+                updatedAt: email.updatedAt,
+              });
+            }
             break;
           }
           case OutboxEventType.SLACK_RATE_LIMIT_ALERT: {
-            // Handled by separate alert worker
+            const alert = event.payload as {
+              senderId: string;
+              senderName: string;
+              hourWindow: string;
+              limit: number;
+              rescheduledCount: number;
+            };
+            await sendSlackAlert(
+              alert.senderId,
+              alert.senderName,
+              new Date(alert.hourWindow),
+              alert.limit,
+              alert.rescheduledCount,
+            );
             break;
           }
         }
 
         await prisma.outboxEvent.update({
           where: { id: event.id },
-          data: { status: OutboxEventStatus.COMPLETED, publishedAt: new Date() },
+          data: { status: OutboxEventStatus.COMPLETED, publishedAt: new Date(), nextAttemptAt: null },
         });
       } catch (err) {
         const error = err as Error;
-        const nextAttempt = new Date(Date.now() + BASE_RETRY_DELAY_MS * Math.pow(2, Math.min(event.attempts, MAX_RETRIES)));
+        // Queue publication is the only durable bridge from a committed
+        // schedule request. Never dead-letter it merely because Redis stayed
+        // down; keep retrying at a bounded rate until queue.add succeeds.
+        const exhausted = event.eventType !== OutboxEventType.PUBLISH_EMAIL_JOB && event.attempts >= MAX_RETRIES;
+        const nextAttempt = exhausted
+          ? null
+          : new Date(Date.now() + Math.min(BASE_RETRY_DELAY_MS * Math.pow(2, Math.min(event.attempts, MAX_RETRIES)), MAX_RETRY_DELAY_MS));
         await prisma.outboxEvent.update({
           where: { id: event.id },
           data: {
-            status: event.attempts >= MAX_RETRIES ? OutboxEventStatus.FAILED : OutboxEventStatus.PENDING,
+            status: exhausted ? OutboxEventStatus.FAILED : OutboxEventStatus.PENDING,
             lastError: error.message,
             nextAttemptAt: nextAttempt,
           },
@@ -115,7 +157,10 @@ async function recoveryScan(): Promise<void> {
   const stuckEvents = await prisma.outboxEvent.findMany({
     where: {
       status: OutboxEventStatus.PROCESSING,
-      createdAt: { lt: new Date(now.getTime() - PUBLISHER_LEASE_MS) },
+      OR: [
+        { nextAttemptAt: { lte: now } },
+        { nextAttemptAt: null, createdAt: { lt: new Date(now.getTime() - PUBLISHER_LEASE_MS) } },
+      ],
     },
     take: BATCH_SIZE,
   });
@@ -123,8 +168,15 @@ async function recoveryScan(): Promise<void> {
   if (stuckEvents.length > 0) {
     const ids = stuckEvents.map(e => e.id);
     await prisma.outboxEvent.updateMany({
-      where: { id: { in: ids } },
-      data: { status: OutboxEventStatus.PENDING, lastError: 'Publisher lease expired, re-queued' },
+      where: {
+        id: { in: ids },
+        status: OutboxEventStatus.PROCESSING,
+        OR: [
+          { nextAttemptAt: { lte: now } },
+          { nextAttemptAt: null, createdAt: { lt: new Date(now.getTime() - PUBLISHER_LEASE_MS) } },
+        ],
+      },
+      data: { status: OutboxEventStatus.PENDING, nextAttemptAt: null, lastError: 'Publisher lease expired, re-queued' },
     });
     console.log(`[OutboxPublisher] Re-queued ${stuckEvents.length} stuck events`);
   }
@@ -143,12 +195,12 @@ export async function startOutboxPublisher(): Promise<void> {
   if (isRunning) return;
   isRunning = true;
 
-  await connectRedis();
   await recoveryScan();
 
   const poll = async () => {
     if (!isRunning) return;
     try {
+      await recoveryScan();
       await processOutboxEvents();
     } catch (err) {
       console.error('[OutboxPublisher] Poll error:', err);
@@ -156,7 +208,7 @@ export async function startOutboxPublisher(): Promise<void> {
     pollTimer = setTimeout(poll, POLL_INTERVAL_MS);
   };
 
-  pollTimer = setTimeout(poll, 100);
+  void poll();
   console.log('[OutboxPublisher] Started');
 }
 
@@ -168,20 +220,4 @@ export async function stopOutboxPublisher(): Promise<void> {
     queue = null;
   }
   console.log('[OutboxPublisher] Stopped');
-}
-
-async function connectRedis(): Promise<void> {
-  let retries = 0;
-  while (retries < MAX_RETRIES) {
-    try {
-      await redis.ping();
-      return;
-    } catch {
-      retries++;
-      const delay = Math.min(BASE_RETRY_DELAY_MS * Math.pow(2, retries), 30000);
-      console.warn(`[OutboxPublisher] Redis connection failed, retrying in ${delay}ms (attempt ${retries}/${MAX_RETRIES})`);
-      await new Promise(r => setTimeout(r, delay));
-    }
-  }
-  throw new Error('[OutboxPublisher] Failed to connect to Redis after max retries');
 }

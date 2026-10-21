@@ -1,6 +1,11 @@
-import { prisma } from '@reachinbox/api/config/prisma.js';
-import { indexEmail, deleteEmail } from '@reachinbox/api/config/elasticsearch.js';
+import 'dotenv/config';
+import { PrismaClient } from '@prisma/client';
+import { indexEmail, deleteEmail } from '../config/elasticsearch.js';
 import { EmailStatus } from '@prisma/client';
+
+const prisma = new PrismaClient({
+  log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
+});
 
 const BATCH_SIZE = 100;
 
@@ -42,7 +47,7 @@ async function reindex() {
           await indexEmail(doc);
         }
         indexed++;
-      } catch (err) {
+      } catch (err: unknown) {
         console.error(`[ES Reindex] Failed to index ${email.id}:`, err);
         failed++;
       }
@@ -55,7 +60,7 @@ async function reindex() {
   await prisma.$disconnect();
 }
 
-reindex().catch(err => {
+reindex().catch((err: unknown) => {
   console.error('[ES Reindex] Fatal error:', err);
   process.exit(1);
 });

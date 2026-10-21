@@ -171,16 +171,18 @@ See [docs/api.md](docs/api.md) for complete API reference.
 
 - **Per-sender hourly cap**: `MAX_EMAILS_PER_HOUR_PER_SENDER` (default 200)
 - **Minimum spacing**: `MIN_DELAY_BETWEEN_EMAILS_MS` (default 2000ms)
-- **Atomic Redis Lua script** ensures limits enforced across worker replicas
-- Rate-limited jobs are **rescheduled** to next available hour window
-- Slack notification sent once per sender/hour when limit reached
+- **UTC fixed-hour windows** and an atomic Redis Lua reservation enforce caps and spacing across worker replicas
+- Rate-limited jobs are returned to BullMQ's delayed state and retain their reservation timestamp
+- Worker concurrency comes from `WORKER_CONCURRENCY` (default 10)
+- When a connected Slack workspace exists, the first skipped full-hour window creates a durable, deduplicated alert event
 
 ## Reliability Features
 
 ### Transactional Outbox
 - Email records + outbox events created in single PostgreSQL transaction
 - API returns `202 Accepted` after DB commit (Redis can be down)
-- Outbox publisher retries with exponential backoff
+- Outbox publisher atomically claims rows with PostgreSQL `SKIP LOCKED`, leases processing rows, and retries with exponential backoff
+- API can start and accept durable scheduling requests while Redis is unavailable; publishing resumes after Redis reconnects
 
 ### Job Persistence
 - Deterministic BullMQ job IDs: `email-${emailId}`
@@ -188,9 +190,11 @@ See [docs/api.md](docs/api.md) for complete API reference.
 - `maxmemory-policy noeviction` prevents job loss
 
 ### Reconciliation
-- Reconciler recreates missing jobs from non-terminal PostgreSQL records
-- Skips `SENT`/`CANCELLED` emails
-- Run manually: `pnpm --filter @reachinbox/worker run reconcile`
+- Worker scans PostgreSQL every 30 seconds and recreates missing, completed, failed, or orphaned BullMQ jobs for `SCHEDULED` emails
+- Skips live queue jobs and never queues `SENT`/`CANCELLED` records
+- Expired `SENDING` leases return to `SCHEDULED` and are queued again; SMTP accept-then-crash remains ambiguous and may produce a duplicate
+- A Redis lock prevents multiple worker replicas from reconciling at the same time
+- Run a one-shot recovery scan manually with `pnpm --filter @reachinbox/worker run reconcile`
 
 ### Idempotency
 - Unique `idempotencyKey` per email (DB constraint)
@@ -228,19 +232,10 @@ pnpm lint
 
 ### Test Coverage
 
-- CSV parsing, validation, deduplication
-- Date/time parsing and delay calculation
-- Redis Lua rate allocator (concurrent calls, hour boundaries)
-- Status transitions and idempotency
-- Elasticsearch mapping and user-scoped queries
-- Duplicate scheduling prevention
-- Delayed job execution timing
-- Worker/API restart persistence
-- Redis outage recovery
-- Multi-worker rate limiting
-- Slack unconnected behavior
-- ES failure/reindexing
-- Auth scoping and Bull Board authorization
+- Worker recovery policy unit tests for live, terminal, missing, and orphaned queue states
+- Redis integration tests for concurrent hourly caps, minimum spacing, sender isolation, and future-window key retention
+- PostgreSQL/BullMQ integration test for replacing terminal jobs, recreating missing jobs, and recovering an expired `SENDING` lease
+- Full SMTP delivery, API restart/outage, OAuth, Slack, Elasticsearch, and Bull Board end-to-end scenarios still require separate configured verification
 
 ## Production Deployment
 

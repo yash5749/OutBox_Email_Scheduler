@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
-import { Search, Loader2 } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { Search, Loader2, Filter, RefreshCw, Send, Mail } from 'lucide-react';
 import { EmailRow } from '@/components/EmailRow';
 import { useToast } from '@/hooks/useToast';
 
@@ -15,151 +15,119 @@ interface Email {
   sender: { id: string; displayName: string; fromEmail: string };
   campaignId: string | null;
   createdAt: string;
-}
-
-interface EmailListResponse {
-  items: Email[];
-  nextCursor: string | null;
-  hasMore: boolean;
-  totalHits: number;
+  body?: string | null;
+  preview?: string | null;
+  snippet?: string | null;
 }
 
 export function SentEmailsTab({ status: initialStatus }: { status?: string }) {
   const [emails, setEmails] = useState<Email[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<string>(initialStatus || 'SENT');
-  const [cursor, setCursor] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState(initialStatus || 'SENT');
+  const [filterOpen, setFilterOpen] = useState(false);
+  const cursorRef = useRef<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [totalHits, setTotalHits] = useState(0);
   const toast = useToast();
 
   const fetchEmails = useCallback(async (reset = false) => {
-    const nextCursor = reset ? null : cursor;
     setLoading(true);
     try {
       const params = new URLSearchParams();
-      if (searchQuery) params.set('q', searchQuery);
+      if (searchQuery.trim()) params.set('q', searchQuery.trim());
       if (statusFilter) params.set('status', statusFilter);
+      const nextCursor = reset ? null : cursorRef.current;
       if (nextCursor) params.set('cursor', nextCursor);
       params.set('limit', '50');
 
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/emails/search?${params}`, {
         credentials: 'include',
       });
-
       if (!res.ok) throw new Error('Failed to fetch emails');
 
-      const data = await res.json();
-      const newEmails = data.data.items || [];
-
-      if (reset) {
-        setEmails(newEmails);
-      } else {
-        setEmails(prev => [...prev, ...newEmails]);
-      }
-      setCursor(data.data.nextCursor || null);
-      setHasMore(data.data.hasMore || false);
-      setTotalHits(data.data.totalHits || 0);
-    } catch (err) {
-      toast.error('Failed to load emails');
+      const result = await res.json();
+      const data = result.data || {};
+      const nextItems: Email[] = data.items || [];
+      setEmails((current) => reset ? nextItems : [...current, ...nextItems]);
+      cursorRef.current = data.nextCursor || null;
+      setHasMore(Boolean(data.hasMore));
+      setTotalHits(Number(data.totalHits || 0));
+    } catch {
+      toast.error('Failed to load sent emails');
     } finally {
       setLoading(false);
     }
-  }, [searchQuery, statusFilter, cursor, toast]);
+  }, [searchQuery, statusFilter, toast]);
 
   useEffect(() => {
-    fetchEmails(true);
-  }, [searchQuery, statusFilter]);
+    const timer = window.setTimeout(() => { void fetchEmails(true); }, 180);
+    return () => window.clearTimeout(timer);
+  }, [fetchEmails]); // Query/filter changes recreate fetchEmails and reset pagination.
 
-  const handleLoadMore = () => {
-    if (hasMore && !loading) fetchEmails(false);
+  const refresh = () => { void fetchEmails(true); };
+  const loadMore = () => {
+    if (hasMore && !loading) void fetchEmails(false);
   };
 
-  if (emails.length === 0 && !loading) {
-    return (
-      <div className="text-center py-12">
-        <Search className="w-12 h-12 text-slate-300 dark:text-slate-600 mx-auto mb-4" />
-        <h3 className="text-lg font-medium text-slate-900 dark:text-white">No {statusFilter.toLowerCase()} emails</h3>
-        <p className="text-slate-500 dark:text-slate-400 mt-1">Sent emails will appear here after delivery</p>
-      </div>
-    );
-  }
-
   return (
-    <div className="space-y-4">
-      <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center justify-between">
-        <div className="relative w-full sm:w-80">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
+    <section className="ri-mail-view" aria-label="Sent emails">
+      <div className="ri-mail-toolbar">
+        <div className="ri-search-box">
+          <Search size={16} strokeWidth={1.8} />
           <input
-            type="text"
+            type="search"
             value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
-            placeholder="Search recipients, subject..."
-            className="w-full pl-10 pr-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-primary-500"
+            onChange={(event) => setSearchQuery(event.target.value)}
+            placeholder="Search"
+            aria-label="Search sent emails"
           />
+          {searchQuery && <button type="button" onClick={() => setSearchQuery('')} aria-label="Clear search">×</button>}
         </div>
-        <div className="flex items-center gap-2">
-          <select
-            value={statusFilter}
-            onChange={e => setStatusFilter(e.target.value)}
-            className="px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white text-sm"
-          >
-            <option value="SENT">Sent</option>
-            <option value="FAILED">Failed</option>
-          </select>
-          <span className="text-sm text-slate-500 dark:text-slate-400">{totalHits} total</span>
+        <div className="ri-toolbar-actions">
+          <div className="ri-filter-wrap">
+            <button type="button" className={`ri-icon-button ${filterOpen ? 'is-active' : ''}`} onClick={() => setFilterOpen((open) => !open)} aria-label="Filter emails" title="Filter">
+              <Filter size={16} />
+            </button>
+            {filterOpen && (
+              <div className="ri-filter-popover">
+                <label htmlFor="sent-status-filter">Status</label>
+                <select id="sent-status-filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+                  <option value="SENT">Sent</option>
+                  <option value="FAILED">Failed</option>
+                </select>
+                <span>{totalHits} matching emails</span>
+              </div>
+            )}
+          </div>
+          <button type="button" className="ri-icon-button" onClick={refresh} aria-label="Refresh sent emails" title="Refresh">
+            <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+          </button>
         </div>
       </div>
 
-      <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead>
-              <tr className="bg-slate-50 dark:bg-slate-900/50 border-b border-slate-200 dark:border-slate-700">
-                <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Recipient</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Subject</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Sent At</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Sender</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Status</th>
-                <th className="px-4 py-3 text-right text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Details</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-200 dark:divide-slate-700">
-              {loading && emails.length === 0 ? (
-                <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center">
-                    <Loader2 className="w-8 h-8 animate-spin text-primary-500 mx-auto" />
-                  </td>
-                </tr>
-              ) : (
-                emails.map(email => (
-                  <EmailRow key={email.id} email={email} showSentAt />
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {hasMore && (
-          <div className="px-4 py-4 border-t border-slate-200 dark:border-slate-700">
-            <button
-              onClick={handleLoadMore}
-              disabled={loading}
-              className="w-full sm:w-auto px-4 py-2 text-sm font-medium text-primary-600 dark:text-primary-400 hover:text-primary-700 dark:hover:text-primary-300 disabled:opacity-50"
-            >
-              {loading ? (
-                <span className="flex items-center justify-center gap-2">
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Loading...
-                </span>
-              ) : (
-                'Load more'
-              )}
-            </button>
+      <div className="ri-email-list" aria-live="polite">
+        {loading && emails.length === 0 ? (
+          <div className="ri-list-state"><Loader2 className="animate-spin" size={24} /><span>Loading sent emails…</span></div>
+        ) : emails.length === 0 ? (
+          <div className="ri-list-state ri-empty-state">
+            <span className="ri-empty-icon"><Send size={22} /></span>
+            <strong>{searchQuery ? 'No matching emails' : statusFilter === 'FAILED' ? 'No failed emails' : 'No sent emails yet'}</strong>
+            <span>{searchQuery ? 'Try another search term or change the status filter.' : 'Emails will appear here after the provider accepts them.'}</span>
           </div>
+        ) : (
+          emails.map((email) => <EmailRow key={email.id} email={email} showSentAt />)
         )}
       </div>
-    </div>
+
+      {hasMore && (
+        <div className="ri-load-more-wrap">
+          <button type="button" className="ri-load-more" onClick={loadMore} disabled={loading}>
+            {loading ? <Loader2 size={14} className="animate-spin" /> : <Mail size={14} />}
+            {loading ? 'Loading…' : `Load more (${totalHits} total)`}
+          </button>
+        </div>
+      )}
+    </section>
   );
 }

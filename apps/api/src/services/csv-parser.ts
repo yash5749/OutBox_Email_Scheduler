@@ -151,8 +151,8 @@ export const ScheduleEmailsRequestSchema = z.object({
   body: z.string().min(1).optional(),
   recipients: z.array(z.string().email()).optional(),
   startAt: z.string().datetime(),
-  minDelayBetweenEmailsMs: z.number().int().positive().min(100).max(3600000).default(2000),
-  maxEmailsPerHour: z.number().int().positive().min(1).max(10000).default(200),
+  minDelayBetweenEmailsMs: z.coerce.number().int().positive().min(100).max(3600000).default(2000),
+  maxEmailsPerHour: z.coerce.number().int().positive().min(1).max(10000).default(200),
 });
 
 export type ScheduleEmailsRequest = z.infer<typeof ScheduleEmailsRequestSchema>;

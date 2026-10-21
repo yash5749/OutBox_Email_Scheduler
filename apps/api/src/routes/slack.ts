@@ -40,7 +40,7 @@ router.get('/connect', requireAuth, (req: Request, res: Response) => {
     const state = generateState(user.id);
     const clientId = process.env.SLACK_CLIENT_ID!;
     const redirectUri = process.env.SLACK_CALLBACK_URL!;
-    const scope = 'chat:write,channels:read,groups:read,im:read,mpim:read';
+    const scope = 'chat:write,channels:read,groups:read,im:read,mpim:read,team:read';
     const url = `https://slack.com/oauth/v2/authorize?client_id=${clientId}&scope=${encodeURIComponent(scope)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
     res.redirect(url);
   } catch (err) {
@@ -55,16 +55,16 @@ router.get('/callback', async (req: Request, res: Response) => {
     const { code, state, error } = req.query;
 
     if (error) {
-      return res.redirect(`${process.env.WEB_URL}/settings?slack_error=${error}`);
+      return res.redirect(`${process.env.WEB_URL}?slack_error=${error}`);
     }
 
     if (!code || !state) {
-      return res.redirect(`${process.env.WEB_URL}/settings?slack_error=missing_params`);
+      return res.redirect(`${process.env.WEB_URL}?slack_error=missing_params`);
     }
 
     const validated = validateState(state as string);
     if (!validated) {
-      return res.redirect(`${process.env.WEB_URL}/settings?slack_error=invalid_state`);
+      return res.redirect(`${process.env.WEB_URL}?slack_error=invalid_state`);
     }
 
     const client = new WebClient();
@@ -119,7 +119,7 @@ router.get('/callback', async (req: Request, res: Response) => {
       },
     });
 
-    res.redirect(`${process.env.WEB_URL}/settings?slack_connected=true`);
+    res.redirect(`${process.env.WEB_URL}?slack_connected=true`);
   } catch (err) {
     console.error('[Slack] Callback error:', err);
     res.redirect(`${process.env.WEB_URL}/settings?slack_error=callback_failed`);
@@ -174,13 +174,18 @@ router.post('/disconnect', requireAuth, async (req: Request, res: Response) => {
 });
 
 export async function sendSlackAlert(senderId: string, senderName: string, hourWindow: Date, limit: number, rescheduledCount: number): Promise<void> {
+  const alertKey = `slack-alert:${senderId}:${hourWindow.toISOString()}:rate-limit`;
   const conn = await prisma.slackConnection.findFirst({
     where: { user: { senders: { some: { id: senderId } } }, status: 'ACTIVE' },
   });
 
-  if (!conn) return;
-
-  const alertKey = `slack-alert:${senderId}:${hourWindow.toISOString()}:rate-limit`;
+  if (!conn) {
+    // A connection may have been removed after the worker queued the alert.
+    // Remove the pending dedupe marker so a later rate-limit event can notify
+    // the user if they reconnect within the same hour.
+    await prisma.slackAlert.deleteMany({ where: { id: alertKey, status: 'PENDING' } });
+    return;
+  }
   const existing = await prisma.slackAlert.findUnique({ where: { id: alertKey } });
   if (existing?.status === 'SENT') return;
 
@@ -196,18 +201,17 @@ export async function sendSlackAlert(senderId: string, senderName: string, hourW
       mrkdwn: true,
     });
 
-    await prisma.slackAlert.upsert({
+    await prisma.slackAlert.updateMany({
       where: { id: alertKey },
-      create: { id: alertKey, senderId, hourWindow, alertType: 'rate-limit', status: 'SENT', sentAt: new Date() },
-      update: { status: 'SENT', sentAt: new Date(), attempts: { increment: 1 } },
+      data: { status: 'SENT', sentAt: new Date(), attempts: { increment: 1 }, lastError: null },
     });
   } catch (err) {
     console.error('[Slack] Alert send failed:', err);
-    await prisma.slackAlert.upsert({
+    await prisma.slackAlert.updateMany({
       where: { id: alertKey },
-      create: { id: alertKey, senderId, hourWindow, alertType: 'rate-limit', status: 'FAILED', lastError: (err as Error).message, attempts: 1 },
-      update: { status: 'FAILED', lastError: (err as Error).message, attempts: { increment: 1 } },
+      data: { status: 'FAILED', lastError: (err as Error).message, attempts: { increment: 1 } },
     });
+    throw err;
   }
 }
 

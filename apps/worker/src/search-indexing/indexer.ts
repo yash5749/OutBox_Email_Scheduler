@@ -1,11 +1,36 @@
+import 'dotenv/config';
 import { Worker, Queue } from 'bullmq';
-import { prisma } from '@reachinbox/api/config/prisma.js';
-import { redisWorker } from '@reachinbox/api/config/redis.js';
-import { indexEmail, deleteEmail } from '@reachinbox/api/config/elasticsearch.js';
-import { getEnv } from '@reachinbox/api/config/env.js';
+import Redis from 'ioredis';
+import { PrismaClient } from '@prisma/client';
+import { indexEmail, deleteEmail } from '../config/elasticsearch.js';
 import { OutboxEventType, OutboxEventStatus } from '@prisma/client';
 
-const env = getEnv();
+const env = {
+  REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379',
+};
+
+let redisWorker: Redis | null = null;
+
+function getRedis(): Redis {
+  if (!redisWorker) {
+    redisWorker = new Redis(env.REDIS_URL, {
+      maxRetriesPerRequest: null,
+      enableReadyCheck: true,
+      lazyConnect: true,
+      retryStrategy: (times) => {
+        if (times > 10) return null;
+        return Math.min(times * 200, 5000);
+      },
+      connectionName: `reachinbox-indexer-${process.pid}`,
+    });
+  }
+  return redisWorker;
+}
+
+const prisma = new PrismaClient({
+  log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
+});
+
 const QUEUE_NAME = 'email-indexing';
 
 const indexerWorker = new Worker(
@@ -48,12 +73,12 @@ const indexerWorker = new Worker(
     console.log(`[Indexer] Indexed email ${emailId} with status ${email.status}`);
   },
   {
-    connection: redisWorker,
+    connection: getRedis(),
     concurrency: 5,
   }
 );
 
-const indexerQueue = new Queue(QUEUE_NAME, { connection: redisWorker });
+const indexerQueue = new Queue(QUEUE_NAME, { connection: getRedis() });
 
 indexerWorker.on('failed', (job, err) => {
   console.error(`[Indexer] Job ${job?.id} failed:`, err.message);
@@ -93,7 +118,7 @@ async function processOutboxIndexing(): Promise<void> {
         where: { id: event.id },
         data: { status: OutboxEventStatus.COMPLETED, publishedAt: new Date() },
       });
-    } catch (err) {
+    } catch (err: unknown) {
       console.error(`[Indexer] Failed to queue indexing for ${event.id}:`, err);
       await prisma.outboxEvent.update({
         where: { id: event.id },
@@ -111,5 +136,7 @@ export const searchIndexer = {
   stop: async () => {
     await indexerWorker.close();
     await indexerQueue.close();
+    const redis = getRedis();
+    await redis.quit();
   },
 };

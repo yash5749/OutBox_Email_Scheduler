@@ -70,16 +70,17 @@ flowchart TD
 
 ### Outbox Publisher (Long-running)
 - Bridges PostgreSQL commits to Redis
-- Retries on Redis errors with bounded exponential backoff
-- Uses `LISTEN/NOTIFY` for low-latency wake-up
-- Recovery scan at startup and after reconnect
+- Claims outbox batches atomically with PostgreSQL `FOR UPDATE SKIP LOCKED`
+- Retries Redis errors with bounded exponential backoff while leaving event rows durable
+- Reclaims processing rows after their persisted lease expires
 - At-least-once publishing with deterministic job IDs
 
 ### Reconciler
-- Repairs divergence when queue data lost or outbox stuck
-- Inspects PostgreSQL truth; skips `SENT`/`CANCELLED` records
-- Safe concurrent claims with DB constraints
-- Does not blindly resend delivered emails
+- Worker runs a recovery scan at startup and every 30 seconds
+- Repairs missing, orphaned, failed, and completed BullMQ jobs only when PostgreSQL still says `SCHEDULED`
+- Recovers expired `SENDING` leases with an explicit SMTP ambiguity error
+- A Redis lease prevents multiple replicas from reconciling at once
+- Never queues `SENT`/`CANCELLED` records
 
 ### Elasticsearch (Search Index Only)
 - Read/search index, never authoritative data store

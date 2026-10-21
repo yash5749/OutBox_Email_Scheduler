@@ -4,7 +4,35 @@ import { useState, useRef, useEffect } from 'react';
 import { useForm, Controller } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { X, Upload, FileText, CheckCircle, AlertCircle, Loader2, Send } from 'lucide-react';
+import {
+  ArrowLeft,
+  Paperclip,
+  Clock,
+  X,
+  Upload,
+  FileText,
+  CheckCircle,
+  AlertCircle,
+  Loader2,
+  Send,
+  Undo2,
+  Redo2,
+  Type,
+  Bold,
+  Italic,
+  Underline,
+  AlignLeft,
+  ListOrdered,
+  List,
+  IndentIncrease,
+  IndentDecrease,
+  Quote,
+  AlignJustify,
+  Strikethrough,
+  CalendarDays,
+  ChevronDown,
+} from 'lucide-react';
+import { addDays, setHours, setMinutes, setSeconds, setMilliseconds } from 'date-fns';
 import { useToast } from '@/hooks/useToast';
 
 const composeSchema = z.object({
@@ -38,14 +66,36 @@ interface ParseResult {
   invalidRows: Array<{ row: number; email: string; reason: string }>;
 }
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
+
+function toLocalDateTimeInput(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function extractEmails(content: string) {
+  const found = content.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
+  return Array.from(new Set(found.map((email) => email.trim().toLowerCase())));
+}
+
+function makeTomorrowAt(hour: number, minute = 0) {
+  const tomorrow = addDays(new Date(), 1);
+  return setMilliseconds(setSeconds(setMinutes(setHours(tomorrow, hour), minute), 0), 0);
+}
+
 export function ComposeModal({ onClose, onSuccess }: ComposeModalProps) {
   const toast = useToast();
   const [senders, setSenders] = useState<Sender[]>([]);
   const [loadingSenders, setLoadingSenders] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [parsing, setParsing] = useState(false);
   const [parseResult, setParseResult] = useState<ParseResult | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
+  const [detectedRecipients, setDetectedRecipients] = useState<string[]>([]);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [hasChosenSchedule, setHasChosenSchedule] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const bodyRef = useRef<HTMLTextAreaElement | null>(null);
 
   const {
     register,
@@ -57,26 +107,41 @@ export function ComposeModal({ onClose, onSuccess }: ComposeModalProps) {
   } = useForm<ComposeFormData>({
     resolver: zodResolver(composeSchema),
     defaultValues: {
+      senderId: '',
+      subject: '',
+      body: '',
       minDelayBetweenEmailsMs: 2000,
       maxEmailsPerHour: 200,
-      startAt: new Date(Date.now() + 5 * 60 * 1000).toISOString().slice(0, 16),
+      startAt: toLocalDateTimeInput(new Date(Date.now() + 5 * 60 * 1000)),
     },
   });
 
-  const watchedStartAt = watch('startAt');
+  const senderId = watch('senderId');
+  const startAt = watch('startAt');
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        if (scheduleOpen) setScheduleOpen(false);
+        else onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose, scheduleOpen]);
 
   useEffect(() => {
     async function fetchSenders() {
       try {
-        const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/senders`, {
-          credentials: 'include',
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setSenders(data.data);
-          if (data.data.length > 0) {
-            setValue('senderId', data.data[0].id);
-          }
+        const res = await fetch(`${API_URL}/api/senders`, { credentials: 'include' });
+        if (!res.ok) throw new Error('Failed to load senders');
+        const result = await res.json();
+        const nextSenders: Sender[] = result.data || [];
+        setSenders(nextSenders);
+        if (nextSenders.length > 0) {
+          setValue('senderId', nextSenders[0].id);
+          if (nextSenders[0].hourlyLimit) setValue('maxEmailsPerHour', nextSenders[0].hourlyLimit);
+          if (nextSenders[0].minDelayMs) setValue('minDelayBetweenEmailsMs', nextSenders[0].minDelayMs);
         }
       } catch {
         toast.error('Failed to load senders');
@@ -84,265 +149,494 @@ export function ComposeModal({ onClose, onSuccess }: ComposeModalProps) {
         setLoadingSenders(false);
       }
     }
-    fetchSenders();
+    void fetchSenders();
   }, [setValue, toast]);
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
     if (!file) return;
+    if (!/\.(csv|txt)$/i.test(file.name)) {
+      toast.error('Upload a CSV or text file');
+      event.target.value = '';
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      toast.error('File must be smaller than 10 MB');
+      event.target.value = '';
+      return;
+    }
 
     setFileName(file.name);
-    const content = await file.text();
-    const mimeType = file.type || (file.name.endsWith('.csv') ? 'text/csv' : 'text/plain');
-
+    setParsing(true);
+    setParseResult(null);
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/emails/parse`, {
+      const content = await file.text();
+      setDetectedRecipients(extractEmails(content));
+      const mimeType = file.type || (file.name.toLowerCase().endsWith('.csv') ? 'text/csv' : 'text/plain');
+      const response = await fetch(`${API_URL}/api/emails/parse`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify({ content, mimeType }),
       });
 
-      if (res.ok) {
-        const data = await res.json();
-        setParseResult(data.data);
+      if (response.ok) {
+        const result = await response.json();
+        setParseResult(result.data);
       } else {
-        toast.error('Failed to parse file');
+        // Keep the local email count visible even when the optional parser endpoint is unavailable.
+        setParseResult({ valid: extractEmails(content).length, invalid: 0, duplicates: 0, invalidRows: [] });
       }
     } catch {
-      toast.error('Failed to parse file');
+      toast.error('The file could not be read');
+      setDetectedRecipients([]);
+    } finally {
+      setParsing(false);
     }
   };
 
   const removeFile = () => {
     setFileName(null);
     setParseResult(null);
+    setDetectedRecipients([]);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const onSubmit = async (data: ComposeFormData) => {
+    const file = fileInputRef.current?.files?.[0];
+    if (!file) {
+      toast.error('Upload a CSV or text file containing recipient email addresses');
+      return;
+    }
+    const selectedStart = new Date(data.startAt);
+    if (!Number.isFinite(selectedStart.getTime()) || selectedStart.getTime() <= Date.now()) {
+      toast.error('Choose a start time in the future');
+      setScheduleOpen(true);
+      return;
+    }
+
     setSubmitting(true);
     try {
       const formData = new FormData();
       formData.append('senderId', data.senderId);
       formData.append('subject', data.subject);
       formData.append('body', data.body);
-      formData.append('startAt', new Date(data.startAt).toISOString());
-      formData.append('minDelayBetweenEmailsMs', data.minDelayBetweenEmailsMs.toString());
-      formData.append('maxEmailsPerHour', data.maxEmailsPerHour.toString());
+      formData.append('startAt', selectedStart.toISOString());
+      formData.append('minDelayBetweenEmailsMs', String(data.minDelayBetweenEmailsMs));
+      formData.append('maxEmailsPerHour', String(data.maxEmailsPerHour));
+      formData.append('file', file);
 
-      if (fileInputRef.current?.files?.[0]) {
-        formData.append('file', fileInputRef.current.files[0]);
-      }
-
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000'}/api/emails/schedule`, {
+      const response = await fetch(`${API_URL}/api/emails/schedule`, {
         method: 'POST',
         credentials: 'include',
         body: formData,
       });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error?.message || 'Failed to schedule emails');
 
-      const result = await res.json();
-
-      if (res.ok) {
-        toast.success(`${result.data.scheduledCount} emails scheduled`);
-        onSuccess();
-      } else {
-        toast.error(result.error?.message || 'Failed to schedule emails');
-      }
-    } catch {
-      toast.error('Failed to schedule emails');
+      toast.success(`${result.data?.scheduledCount ?? detectedRecipients.length} emails scheduled`);
+      onSuccess();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to schedule emails');
     } finally {
       setSubmitting(false);
     }
   };
 
+  const setPreset = (date: Date) => {
+    setValue('startAt',(toLocalDateTimeInput(date)), { shouldValidate: true, shouldDirty: true });
+    setHasChosenSchedule(true);
+  };
+
+  const bodyRegistration = register('body');
+
+  const toolbarButton = (label: string, Icon: typeof Bold, action?: () => void) => (
+    <button key={label} type="button" className="ri-editor-tool" title={label} aria-label={label} onClick={action}>
+      <Icon size={16} strokeWidth={1.8} />
+    </button>
+  );
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50" onClick={onClose}>
-      <div className="bg-white dark:bg-slate-800 rounded-xl shadow-xl max-w-3xl w-full max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 dark:border-slate-700 sticky top-0 bg-white dark:bg-slate-800 z-10">
-          <h2 className="text-xl font-bold text-slate-900 dark:text-white">Compose New Email</h2>
-          <button onClick={onClose} className="p-2 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700">
-            <X className="w-5 h-5" />
+    <div
+      className="ri-compose-screen"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="compose-heading"
+    >
+      <header className="ri-compose-header">
+        <div className="ri-compose-heading-wrap">
+          <button
+            type="button"
+            className="ri-compose-back"
+            onClick={onClose}
+            aria-label="Back to inbox"
+            title="Back"
+          >
+            <ArrowLeft size={22} strokeWidth={1.7} />
+          </button>
+          <h1 id="compose-heading">Compose New Email</h1>
+        </div>
+        <div className="ri-compose-header-actions">
+          <button
+            type="button"
+            className="ri-compose-tool-button"
+            title="Upload recipient list"
+            aria-label="Upload recipient list"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Paperclip size={19} strokeWidth={1.8} />
+            {fileName && <span className="ri-attachment-count">1</span>}
+          </button>
+          <button
+            type="button"
+            className={`ri-compose-tool-button ${scheduleOpen ? "is-active" : ""}`}
+            title="Schedule send"
+            aria-label="Schedule send"
+            onClick={() => setScheduleOpen((open) => !open)}
+          >
+            <Clock size={19} strokeWidth={1.8} />
+          </button>
+          <button
+            type="submit"
+            form="compose-email-form"
+            className="ri-send-button"
+            disabled={submitting || loadingSenders || !senderId}
+          >
+            {submitting ? (
+              <Loader2 size={15} className="animate-spin" />
+            ) : (
+              <Send size={14} />
+            )}
+            {submitting
+              ? "Scheduling…"
+              : hasChosenSchedule
+                ? "Send Later"
+                : "Send"}
           </button>
         </div>
+      </header>
 
-        <form onSubmit={handleSubmit(onSubmit)} className="p-6 space-y-6">
-          <div>
-            <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Sender</label>
-            {loadingSenders ? (
-              <div className="h-10 bg-slate-100 dark:bg-slate-700 rounded-lg animate-pulse" />
-            ) : (
-              <select
-                {...register('senderId')}
-                className="w-full px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary-500"
-              >
-                {senders.map(sender => (
-                  <option key={sender.id} value={sender.id}>
-                    {sender.displayName} ({sender.fromEmail})
-                  </option>
-                ))}
-              </select>
-            )}
-            {errors.senderId && <p className="mt-1 text-sm text-red-600 dark:text-red-400">{errors.senderId.message}</p>}
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Subject</label>
+      {scheduleOpen && (
+        <div
+          className="ri-schedule-popover"
+          role="dialog"
+          aria-label="Send later options"
+        >
+          <div className="ri-schedule-popover-title">Send Later</div>
+          <label className="ri-date-input-wrap">
+            <span className="sr-only">Pick date and time</span>
             <input
-              {...register('subject')}
-              type="text"
-              className="w-full px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary-500"
-              placeholder="Enter email subject"
+              type="datetime-local"
+              value={startAt}
+              onChange={(event) => {
+                if (event.target.value) setPreset(new Date(event.target.value));
+              }}
             />
-            {errors.subject && <p className="mt-1 text-sm text-red-600 dark:text-red-400">{errors.subject.message}</p>}
+            <CalendarDays size={16} />
+          </label>
+          <div className="ri-schedule-presets">
+            <button
+              type="button"
+              onClick={() =>
+                setPreset(
+                  makeTomorrowAt(
+                    new Date().getHours(),
+                    new Date().getMinutes(),
+                  ),
+                )
+              }
+            >
+              Tomorrow
+            </button>
+            <button type="button" onClick={() => setPreset(makeTomorrowAt(10))}>
+              Tomorrow, 10:00 AM
+            </button>
+            <button type="button" onClick={() => setPreset(makeTomorrowAt(11))}>
+              Tomorrow, 11:00 AM
+            </button>
+            <button type="button" onClick={() => setPreset(makeTomorrowAt(15))}>
+              Tomorrow, 3:00 PM
+            </button>
+          </div>
+          <div className="ri-schedule-popover-footer">
+            <button
+              type="button"
+              className="ri-text-button"
+              onClick={() => setScheduleOpen(false)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="ri-outline-green-button"
+              onClick={() => {
+                setHasChosenSchedule(true);
+                setScheduleOpen(false);
+              }}
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      )}
+
+      <form
+        id="compose-email-form"
+        onSubmit={handleSubmit(onSubmit)}
+        className="ri-compose-form"
+      >
+        <input type="hidden" {...register("startAt")} />
+
+        <div className="ri-compose-fields">
+          <div className="ri-compose-field-row">
+            <label htmlFor="compose-sender">From</label>
+            <div className="ri-from-select-wrap">
+              {loadingSenders ? (
+                <span className="ri-sender-loading">
+                  <Loader2 size={14} className="animate-spin" /> Loading
+                  senders…
+                </span>
+              ) : (
+                <select
+                  id="compose-sender"
+                  {...register("senderId")}
+                  disabled={senders.length === 0}
+                >
+                  {senders.length === 0 && (
+                    <option value="">No senders connected</option>
+                  )}
+                  {senders.map((sender) => (
+                    <option key={sender.id} value={sender.id}>
+                      {sender.fromEmail}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <ChevronDown size={15} />
+            </div>
+            {errors.senderId && (
+              <p className="ri-compose-error">{errors.senderId.message}</p>
+            )}
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Body</label>
-            <textarea
-              {...register('body')}
-              rows={6}
-              className="w-full px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary-500 font-mono text-sm"
-              placeholder="Enter email body (plain text)"
-            />
-            {errors.body && <p className="mt-1 text-sm text-red-600 dark:text-red-400">{errors.body.message}</p>}
-          </div>
-
-          <div className="border-t border-slate-200 dark:border-slate-700 pt-6">
-            <h3 className="text-lg font-medium text-slate-900 dark:text-white mb-4">Recipients</h3>
-
-            <div className="relative">
+          <div className="ri-compose-field-row ri-to-row">
+            <label>To</label>
+            <div className="ri-recipient-line">
+              <div className="ri-recipient-chips" aria-live="polite">
+                {detectedRecipients.length === 0 ? (
+                  <span className="ri-recipient-placeholder">
+                    recipient@example.com
+                  </span>
+                ) : (
+                  <>
+                    {detectedRecipients.slice(0, 3).map((recipient) => (
+                      <span className="ri-recipient-chip" key={recipient}>
+                        {recipient}
+                      </span>
+                    ))}
+                    {detectedRecipients.length > 3 && (
+                      <span className="ri-recipient-chip ri-more-chip">
+                        +{detectedRecipients.length - 3}
+                      </span>
+                    )}
+                  </>
+                )}
+              </div>
+              <button
+                type="button"
+                className="ri-upload-list-button"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <Upload size={15} /> Upload List
+              </button>
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".csv,.txt"
+                accept=".csv,.txt,text/csv,text/plain"
                 onChange={handleFileChange}
-                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                className="ri-hidden-file-input"
               />
-              <div className="border-2 border-dashed border-slate-300 dark:border-slate-600 rounded-lg p-6 text-center hover:border-primary-500 transition-colors">
-                {fileName ? (
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <FileText className="w-6 h-6 text-slate-500" />
-                      <span className="text-slate-700 dark:text-slate-300">{fileName}</span>
-                    </div>
-                    <button type="button" onClick={removeFile} className="text-slate-500 hover:text-red-600">Remove</button>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center gap-2">
-                    <Upload className="w-8 h-8 text-slate-400" />
-                    <span className="text-slate-600 dark:text-slate-400">Drag & drop CSV or text file</span>
-                    <span className="text-xs text-slate-500">One email per line or CSV with "email" column</span>
-                  </div>
-                )}
-              </div>
             </div>
+          </div>
 
-            {parseResult && (
-              <div className="mt-4 p-4 bg-slate-50 dark:bg-slate-900/30 rounded-lg space-y-2">
-                <div className="flex items-center gap-4 text-sm">
-                  <span className="flex items-center gap-1 text-green-600 dark:text-green-400">
-                    <CheckCircle className="w-4 h-4" />
-                    {parseResult.valid} valid
+          <div className="ri-compose-field-row">
+            <label htmlFor="compose-subject">Subject</label>
+            <div className="ri-subject-input-wrap">
+              <input
+                id="compose-subject"
+                {...register("subject")}
+                placeholder="Subject"
+              />
+              {errors.subject && (
+                <p className="ri-compose-error">{errors.subject.message}</p>
+              )}
+            </div>
+          </div>
+
+          <div className="ri-sending-rules-row">
+            <label htmlFor="compose-delay">Delay between 2 emails</label>
+            <Controller
+              name="minDelayBetweenEmailsMs"
+              control={control}
+              render={({ field }) => (
+                <input
+                  id="compose-delay"
+                  type="number"
+                  min={100}
+                  max={3600000}
+                  value={field.value}
+                  onChange={(event) =>
+                    field.onChange(Number(event.target.value))
+                  }
+                />
+              )}
+            />
+            <span className="ri-field-hint">ms</span>
+            <label htmlFor="compose-hourly-limit">Hourly Limit</label>
+            <Controller
+              name="maxEmailsPerHour"
+              control={control}
+              render={({ field }) => (
+                <input
+                  id="compose-hourly-limit"
+                  type="number"
+                  min={1}
+                  max={10000}
+                  value={field.value}
+                  onChange={(event) =>
+                    field.onChange(Number(event.target.value))
+                  }
+                />
+              )}
+            />
+            <span className="ri-field-hint">emails</span>
+          </div>
+          {(errors.minDelayBetweenEmailsMs || errors.maxEmailsPerHour) && (
+            <p className="ri-compose-error">
+              {errors.minDelayBetweenEmailsMs?.message ||
+                errors.maxEmailsPerHour?.message}
+            </p>
+          )}
+
+          <div className="ri-message-editor">
+            <textarea
+              {...bodyRegistration}
+              ref={(element) => {
+                bodyRegistration.ref(element);
+                bodyRef.current = element;
+              }}
+              placeholder="Type Your Reply..."
+              aria-label="Email body"
+              className="ri-message-body"
+            />
+            {errors.body && (
+              <p className="ri-compose-error ri-body-error">
+                {errors.body.message}
+              </p>
+            )}
+            <div className="ri-editor-toolbar" aria-label="Formatting toolbar">
+              {toolbarButton("Undo", Undo2, () => document.execCommand("undo"))}
+              {toolbarButton("Redo", Redo2, () => document.execCommand("redo"))}
+              <span className="ri-toolbar-divider" />
+              {toolbarButton("Text options", Type, () =>
+                bodyRef.current?.focus(),
+              )}
+              <span className="ri-toolbar-divider" />
+              {toolbarButton("Bold", Bold, () => {
+                bodyRef.current?.focus();
+                document.execCommand("bold");
+              })}
+              {toolbarButton("Italic", Italic, () => {
+                bodyRef.current?.focus();
+                document.execCommand("italic");
+              })}
+              {toolbarButton("Underline", Underline, () => {
+                bodyRef.current?.focus();
+                document.execCommand("underline");
+              })}
+              <span className="ri-toolbar-divider" />
+              {toolbarButton("Align left", AlignLeft, () =>
+                bodyRef.current?.focus(),
+              )}
+              {toolbarButton("Line spacing", ChevronDown, () =>
+                bodyRef.current?.focus(),
+              )}
+              <span className="ri-toolbar-divider" />
+              {toolbarButton("Numbered list", ListOrdered, () =>
+                bodyRef.current?.focus(),
+              )}
+              {toolbarButton("Bulleted list", List, () =>
+                bodyRef.current?.focus(),
+              )}
+              {toolbarButton("Increase indent", IndentIncrease, () =>
+                bodyRef.current?.focus(),
+              )}
+              {toolbarButton("Decrease indent", IndentDecrease, () =>
+                bodyRef.current?.focus(),
+              )}
+              {toolbarButton("Quote", Quote, () => bodyRef.current?.focus())}
+              {toolbarButton("Align justify", AlignJustify, () =>
+                bodyRef.current?.focus(),
+              )}
+              {toolbarButton("Strikethrough", Strikethrough, () => {
+                bodyRef.current?.focus();
+                document.execCommand("strikeThrough");
+              })}
+            </div>
+          </div>
+
+          {fileName && (
+            <div className="ri-uploaded-file-row">
+              <FileText size={17} />
+              <div className="ri-uploaded-file-copy">
+                <strong>{fileName}</strong>
+                <span>
+                  {parsing
+                    ? "Reading recipient list…"
+                    : `${
+                        Array.isArray(parseResult?.valid)
+                          ? parseResult.valid.length
+                          : typeof parseResult?.valid === "number"
+                            ? parseResult.valid
+                            : detectedRecipients.length
+                      } email addresses detected`}
+                </span>
+              </div>
+              {!parsing && parseResult && (
+                <CheckCircle size={16} className="ri-file-success" />
+              )}
+              {parsing && <Loader2 size={16} className="animate-spin" />}
+              <button
+                type="button"
+                onClick={removeFile}
+                aria-label="Remove recipient list"
+              >
+                <X size={15} />
+              </button>
+            </div>
+          )}
+
+          {parseResult &&
+            (parseResult.invalid > 0 || parseResult.duplicates > 0) && (
+              <div className="ri-parse-summary">
+                <span>
+                  <CheckCircle size={14} /> {parseResult.valid} valid
+                </span>
+                {parseResult.invalid > 0 && (
+                  <span className="has-warning">
+                    <AlertCircle size={14} /> {parseResult.invalid} invalid
                   </span>
-                  <span className="flex items-center gap-1 text-red-600 dark:text-red-400">
-                    <AlertCircle className="w-4 h-4" />
-                    {parseResult.invalid} invalid
+                )}
+                {parseResult.duplicates > 0 && (
+                  <span className="has-warning">
+                    <AlertCircle size={14} /> {parseResult.duplicates}{" "}
+                    duplicates
                   </span>
-                  <span className="flex items-center gap-1 text-yellow-600 dark:text-yellow-400">
-                    <AlertCircle className="w-4 h-4" />
-                    {parseResult.duplicates} duplicates
-                  </span>
-                </div>
-                {parseResult.invalidRows.length > 0 && (
-                  <details className="text-xs text-slate-600 dark:text-slate-400">
-                    <summary className="cursor-pointer">Show invalid rows</summary>
-                    <ul className="mt-1 space-y-1">
-                      {parseResult.invalidRows.slice(0, 10).map((row, i) => (
-                        <li key={i}>Row {row.row}: {row.email} — {row.reason}</li>
-                      ))}
-                      {parseResult.invalidRows.length > 10 && (
-                        <li>... and {parseResult.invalidRows.length - 10} more</li>
-                      )}
-                    </ul>
-                  </details>
                 )}
               </div>
             )}
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 border-t border-slate-200 dark:border-slate-700 pt-6">
-            <div>
-              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Start Time</label>
-              <Controller
-                name="startAt"
-                control={control}
-                render={({ field }) => (
-                  <input
-                    {...field}
-                    type="datetime-local"
-                    className="w-full px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary-500"
-                  />
-                )}
-              />
-              {errors.startAt && <p className="mt-1 text-sm text-red-600 dark:text-red-400">{errors.startAt.message}</p>}
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Min Delay (ms)</label>
-              <Controller
-                name="minDelayBetweenEmailsMs"
-                control={control}
-                render={({ field }) => (
-                  <input
-                    {...field}
-                    type="number"
-                    min="100"
-                    max="3600000"
-                    className="w-full px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary-500"
-                  />
-                )}
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Hourly Limit</label>
-              <Controller
-                name="maxEmailsPerHour"
-                control={control}
-                render={({ field }) => (
-                  <input
-                    {...field}
-                    type="number"
-                    min="1"
-                    max="10000"
-                    className="w-full px-3 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary-500"
-                  />
-                )}
-              />
-            </div>
-          </div>
-
-          <div className="flex justify-end gap-3 border-t border-slate-200 dark:border-slate-700 pt-6">
-            <button type="button" onClick={onClose} className="px-4 py-2 text-slate-700 dark:text-slate-300 font-medium rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700">
-              Cancel
-            </button>
-            <button type="submit" disabled={submitting} className="px-4 py-2 bg-primary-500 text-white font-medium rounded-lg hover:bg-primary-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
-              {submitting ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Scheduling...
-                </>
-              ) : (
-                <>
-                  <Send className="w-4 h-4" />
-                  Schedule Emails
-                </>
-              )}
-            </button>
-          </div>
-        </form>
-      </div>
+        </div>
+      </form>
     </div>
   );
 }

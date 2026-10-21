@@ -1,5 +1,6 @@
+import 'dotenv/config';
 import { PrismaClient } from '@prisma/client';
-import { encrypt } from '../apps/api/src/config/encryption';
+import { encrypt } from '../apps/api/src/config/encryption.js';
 
 const prisma = new PrismaClient();
 
@@ -9,26 +10,25 @@ async function main() {
   // Create demo user (will be created via Google OAuth in real usage)
   // This is just for local development with seeded senders
 
-  // Create Ethereal senders for demo
-  // In production, these would be created via Ethereal API or configured manually
+  // Create Ethereal senders for demo using real credentials
   const senders = [
     {
-      displayName: 'Demo Sender 1',
-      fromEmail: 'sender1@ethereal.email',
+      displayName: 'Ethereal Sender 1',
+      fromEmail: 'kamren.raynor@ethereal.email',
       smtpHost: 'smtp.ethereal.email',
       smtpPort: 587,
-      smtpUser: 'sender1@ethereal.email',
-      smtpPassword: 'ethereal-password-1',
+      smtpUser: 'kamren.raynor@ethereal.email',
+      smtpPassword: 'u46yCMhtadvnypB5QM',
       hourlyLimit: 200,
       minDelayMs: 2000,
     },
     {
-      displayName: 'Demo Sender 2',
-      fromEmail: 'sender2@ethereal.email',
+      displayName: 'Ethereal Sender 2',
+      fromEmail: 'elmore.dicki@ethereal.email',
       smtpHost: 'smtp.ethereal.email',
       smtpPort: 587,
-      smtpUser: 'sender2@ethereal.email',
-      smtpPassword: 'ethereal-password-2',
+      smtpUser: 'elmore.dicki@ethereal.email',
+      smtpPassword: 'ZhUhe91q4y1Dfk99q4',
       hourlyLimit: 100,
       minDelayMs: 3000,
     },
@@ -53,7 +53,17 @@ async function main() {
   for (const sender of senders) {
     const existing = await prisma.sender.findFirst({ where: { fromEmail: sender.fromEmail } });
     if (existing) {
-      console.log('[Seed] Sender already exists:', sender.fromEmail);
+      // Update with new credentials
+      await prisma.sender.update({
+        where: { id: existing.id },
+        data: {
+          smtpUser: sender.smtpUser,
+          smtpPasswordEncrypted: encrypt(sender.smtpPassword),
+          hourlyLimit: sender.hourlyLimit,
+          minDelayMs: sender.minDelayMs,
+        },
+      });
+      console.log('[Seed] Updated sender:', sender.fromEmail);
       continue;
     }
 

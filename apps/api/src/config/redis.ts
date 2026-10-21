@@ -8,8 +8,7 @@ export const redis = new Redis(env.REDIS_URL, {
   enableReadyCheck: true,
   lazyConnect: true,
   retryStrategy: (times) => {
-    if (times > 10) return null;
-    return Math.min(times * 200, 5000);
+    return Math.min(times * 200, 30000);
   },
   connectionName: `reachinbox-api-${process.pid}`,
 });
@@ -19,8 +18,7 @@ export const redisWorker = new Redis(env.REDIS_URL, {
   enableReadyCheck: true,
   lazyConnect: true,
   retryStrategy: (times) => {
-    if (times > 10) return null;
-    return Math.min(times * 200, 5000);
+    return Math.min(times * 200, 30000);
   },
   connectionName: `reachinbox-worker-${process.pid}`,
 });
@@ -34,8 +32,18 @@ redisWorker.on('error', (err) => {
 });
 
 export async function connectRedis(): Promise<void> {
-  await redis.connect();
-  await redisWorker.connect();
+  if (redis.status === 'wait') {
+    await redis.connect();
+  } else if (redis.status === 'end') {
+    // Recreate the client if it was closed
+    throw new Error('Redis client was closed, need to restart process');
+  }
+
+  if (redisWorker.status === 'wait') {
+    await redisWorker.connect();
+  } else if (redisWorker.status === 'end') {
+    throw new Error('Redis worker client was closed, need to restart process');
+  }
 }
 
 export async function disconnectRedis(): Promise<void> {
