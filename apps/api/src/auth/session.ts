@@ -13,7 +13,9 @@ export const sessionMiddleware: express.RequestHandler = session({
   cookie: {
     httpOnly: true,
     secure: env.NODE_ENV === 'production',
-    sameSite: 'lax',
+    // Vercel and Render use different sites by default. The browser needs
+    // cross-site cookies for credentialed API requests in production.
+    sameSite: env.NODE_ENV === 'production' ? 'none' : 'lax',
     maxAge: 1000 * 60 * 60 * 24 * 30, // 30 days
   },
   rolling: true,

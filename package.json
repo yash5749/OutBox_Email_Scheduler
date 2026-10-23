@@ -16,6 +16,7 @@
     "test:integration": "pnpm -r run test:integration",
     "build": "pnpm -r run build",
     "docker:build": "docker compose build",
+    "deploy:vercel": "bash scripts/deploy-vercel.sh",
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down -v"
   },

@@ -2,7 +2,9 @@ import { z } from 'zod';
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
-  API_PORT: z.coerce.number().default(4000),
+  // Render provides PORT. Keep API_PORT available for local development and
+  // allow an explicit override when running outside Render.
+  API_PORT: z.coerce.number().default(Number(process.env.PORT) || 4000),
   WEB_URL: z.string().url().default('http://localhost:3000'),
   API_BASE_URL: z.string().url().default('http://localhost:4000'),
 
