@@ -1,6 +1,8 @@
 # ReachInbox Email Scheduler
 
 A production-minded full-stack email scheduling application built with TypeScript, Node.js, Express, BullMQ, PostgreSQL, Elasticsearch, and Next.js.
+# NOTE
+This project can’t be reliably hosted completely free. It needs an always-on API and background worker, persistent PostgreSQL and Redis, and Elasticsearch. Free hosting tiers may sleep or don’t provide all of those services, so scheduled emails might not run reliably. The frontend may fit on a free Vercel tier, but the full application requires paid hosting for dependable operation.
 
 ## Features
 
